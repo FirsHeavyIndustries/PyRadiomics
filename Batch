@@ -1,0 +1,244 @@
+import os
+import shlex
+import subprocess
+from pathlib import Path
+from typing import List, Optional, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+import SimpleITK as sitk
+from radiomics import featureextractor
+import logging
+
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+ROOT = Path("/Users/np/DICOM")                  # parent folder containing LSxxxx_GTV... folders
+OUT_ROOT = Path("/Users/np/Desktop/OP_BATCH_2")   # output destination
+OUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+MASK_LABEL = 255
+HU_P = 70
+
+BRANCHES = {
+    "pre": "Pre",
+    "post": "Post",
+}
+
+# Archetypal folder names:
+DICOM_TOP = "DICOM"
+RTSTRUCT_TOP = "RTSTRUCT"
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def safe_iterdir(p: Path):
+    try:
+        return list(p.iterdir())
+    except Exception:
+        return []
+
+def find_candidate_dicom_series_dirs(branch_dir: Path, min_files: int = 10) -> List[Path]:
+    """
+    Search only under <branch>/DICOM/** for DICOM series directories.
+    A "series directory" is any dir where SimpleITK sees at least one series ID.
+    """
+    dicom_root = branch_dir / DICOM_TOP
+    if not dicom_root.exists():
+        return []
+
+    series_dirs: List[Path] = []
+    for d in dicom_root.rglob("*"):
+        if not d.is_dir():
+            continue
+        # quick prefilter: directory has enough files
+        files = [x for x in safe_iterdir(d) if x.is_file()]
+        if len(files) < min_files:
+            continue
+        try:
+            ids = sitk.ImageSeriesReader.GetGDCMSeriesIDs(str(d))
+            if ids:
+                series_dirs.append(d)
+        except Exception:
+            pass
+
+    return series_dirs
+
+def choose_best_series(series_dirs: List[Path]) -> Optional[Path]:
+    """
+    Choose the series directory with the most files.
+    """
+    if not series_dirs:
+        return None
+    scored = []
+    for d in series_dirs:
+        try:
+            n = sum(1 for x in d.iterdir() if x.is_file())
+        except Exception:
+            n = 0
+        scored.append((n, d))
+    scored.sort(reverse=True)
+    return scored[0][1]
+
+def find_rtstruct_files(branch_dir: Path) -> List[Path]:
+    """
+    Search only under <branch>/RTSTRUCT/** for RTSTRUCT .dcm files.
+    We do NOT rely on DICOM metadata here (faster, matches your archetype).
+    Selection defaults to newest file.
+    """
+    rt_root = branch_dir / RTSTRUCT_TOP
+    if not rt_root.exists():
+        return []
+
+    # Most RTSTRUCTs are .dcm; if yours sometimes aren't, extend this.
+    files = list(rt_root.rglob("*.dcm"))
+    # Filter tiny junk
+    files = [p for p in files if p.is_file() and p.stat().st_size > 1024]
+    # Newest first
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return files
+
+def pick_image_nifti(out_dir: Path) -> Path:
+    nii = sorted(out_dir.glob("*.nii*"))
+    for p in nii:
+        if p.name.lower().startswith("image.nii"):
+            return p
+    non_masks = [p for p in nii if "mask" not in p.name.lower()]
+    if not non_masks:
+        raise FileNotFoundError(f"No image NIfTI found in {out_dir}")
+    return non_masks[0]
+
+def hu_percentile(image_path: Path, mask_path: Path, p: float, label: int = MASK_LABEL) -> float:
+    img = sitk.ReadImage(str(image_path))
+    msk = sitk.ReadImage(str(mask_path))
+    img_arr = sitk.GetArrayFromImage(img).astype(np.float32)
+    msk_arr = sitk.GetArrayFromImage(msk)
+    vals = img_arr[msk_arr == label]
+    if vals.size == 0:
+        raise ValueError(f"No voxels for label={label} in {mask_path.name}")
+    return float(np.percentile(vals, p))
+
+def run_dcmrtstruct2nii(dicom_dir: Path, rtstruct_file: Path, out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = ["dcmrtstruct2nii", "convert", "-d", str(dicom_dir), "-r", str(rtstruct_file), "-o", str(out_dir)]
+    print("Running:", " ".join(shlex.quote(x) for x in cmd))
+    subprocess.run(cmd, check=True)
+
+def radiomics_to_csv(out_dir: Path, csv_path: Path, case_name: str, branch: str) -> pd.DataFrame:
+    image_path = pick_image_nifti(out_dir)
+    masks = sorted(out_dir.glob("mask_*.nii*"))
+    if not masks:
+        raise FileNotFoundError(f"No masks found in {out_dir}")
+
+    extractor = featureextractor.RadiomicsFeatureExtractor()
+    rows = []
+    for m in masks:
+        roi = m.name.replace("mask_", "").split(".nii")[0]
+        res = extractor.execute(str(image_path), str(m), label=MASK_LABEL)
+        res = {k: v for k, v in res.items() if not k.startswith("diagnostics")}
+        res["case"] = case_name
+        res["branch"] = branch
+        res["ROI"] = roi
+        res[f"custom_HU_P{int(HU_P)}"] = hu_percentile(image_path, m, HU_P, label=MASK_LABEL)
+        rows.append(res)
+
+    df = pd.DataFrame(rows)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(csv_path, index=False)
+    return df
+
+
+# -----------------------------
+# Main loop
+# -----------------------------
+case_dirs = sorted([p for p in ROOT.iterdir() if p.is_dir()])
+print("Found case folders:", len(case_dirs))
+
+summary_rows = []
+all_feature_dfs = []
+
+for case_dir in case_dirs:
+    case_name = case_dir.name
+
+    for branch_key, branch_folder in BRANCHES.items():
+        branch_dir = case_dir / branch_folder
+
+        if not branch_dir.exists():
+            summary_rows.append({
+                "case": case_name, "branch": branch_key, "status": "missing",
+                "error": f"Missing branch folder: {branch_dir}"
+            })
+            continue
+
+        # find DICOM series under <branch>/DICOM/**
+        series_dirs = find_candidate_dicom_series_dirs(branch_dir)
+        dicom_dir = choose_best_series(series_dirs)
+
+        if dicom_dir is None:
+            summary_rows.append({
+                "case": case_name, "branch": branch_key, "status": "failed",
+                "error": f"No readable DICOM series found under {branch_dir / DICOM_TOP}"
+            })
+            continue
+
+        # find RTSTRUCT file under <branch>/RTSTRUCT/**
+        rtstruct_files = find_rtstruct_files(branch_dir)
+        if not rtstruct_files:
+            summary_rows.append({
+                "case": case_name, "branch": branch_key, "status": "failed",
+                "dicom_dir": str(dicom_dir),
+                "error": f"No RTSTRUCT .dcm found under {branch_dir / RTSTRUCT_TOP}"
+            })
+            continue
+
+        rtstruct_file = rtstruct_files[0]  # newest
+
+        # convert outputs go to: OUT_ROOT/<case>/<pre|post>/
+        out_dir = OUT_ROOT / case_name / branch_key
+
+        # CSV naming: <case>_<pre|post>.csv (exactly as requested)
+        csv_path = OUT_ROOT / case_name / f"{case_name}_{branch_key}.csv"
+
+        try:
+            run_dcmrtstruct2nii(dicom_dir, rtstruct_file, out_dir)
+            df = radiomics_to_csv(out_dir, csv_path, case_name, branch_key)
+
+            summary_rows.append({
+                "case": case_name, "branch": branch_key, "status": "ok",
+                "dicom_dir": str(dicom_dir),
+                "rtstruct": str(rtstruct_file),
+                "out_dir": str(out_dir),
+                "csv": str(csv_path),
+                "n_rois": len(df)
+            })
+            all_feature_dfs.append(df)
+
+            print(f"[OK] {case_name} {branch_key} -> {csv_path}")
+
+        except Exception as e:
+            summary_rows.append({
+                "case": case_name, "branch": branch_key, "status": "failed",
+                "dicom_dir": str(dicom_dir),
+                "rtstruct": str(rtstruct_file),
+                "out_dir": str(out_dir),
+                "csv": str(csv_path),
+                "error": repr(e)
+            })
+            print(f"[FAILED] {case_name} {branch_key} -> {e}")
+
+summary_df = pd.DataFrame(summary_rows)
+summary_csv = OUT_ROOT / "batch_summary.csv"
+summary_df.to_csv(summary_csv, index=False)
+print("Wrote summary:", summary_csv)
+
+if all_feature_dfs:
+    all_df = pd.concat(all_feature_dfs, ignore_index=True)
+    all_csv = OUT_ROOT / "radiomics_all_cases_prepost.csv"
+    all_df.to_csv(all_csv, index=False)
+    print("Wrote combined:", all_csv)
+    display(all_df.head())
+else:
+    print("No features extracted.")
+    display(summary_df.head())
